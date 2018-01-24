@@ -4,6 +4,7 @@
 #include "stream.h"
 #include "meta.h"
 
+uint64_t glob_count=0;
 uint64_t to_pref[NUM_PREFETCHERS],
 	score[NUM_PREFETCHERS],
 	num_pf_issued[NUM_PREFETCHERS],
@@ -112,8 +113,8 @@ for(int i=0; i<NUM_PREFETCHERS; i++){
 	accuracy[i] = ((float)score[i])/num_pf_issued[i];
 	useful_per_access[i] = ((float)score[i])/CHECK_SCORE;
 	final_score[i] = (int)((accuracy[i] + useful_per_access[i])*100);
-	if(to_pref[i] == 1)
-		pref_stats[i] = pref_stats[i] + score[i];
+	// if(to_pref[i] == 1)
+	// 	pref_stats[i] = pref_stats[i] + score[i];
 }
 
 	int max_score = 0, entry = 0;
@@ -219,6 +220,7 @@ printf("BO: %d \n", pref_stats[3]);
 printf("VLDP: %d \n", pref_stats[4]);
 printf("KPCP: %d \n", pref_stats[5]);
 printf("stream: %d \n", pref_stats[6]);
+printf("pref_count: %lld \n", glob_count);
 printf("\n");
 
 }
@@ -227,6 +229,8 @@ void CACHE::next_line_operate(uint64_t addr, uint64_t ip, uint8_t cache_hit, uin
 	uint64_t pf_addr = ((addr>>LOG2_BLOCK_SIZE)+1) << LOG2_BLOCK_SIZE;
 	if(to_pref[0]){
 		prefetch_line(ip, addr, pf_addr, FILL_L2);
+		glob_count++;
+		pref_stats[0]++;
 		printf("at NL\n");
 	}
 	RR_table_update(pf_addr, 0);
@@ -302,13 +306,19 @@ void CACHE::ip_stride_operate(uint64_t addr, uint64_t ip, uint8_t cache_hit, uin
             // check the MSHR occupancy to decide if we're going to prefetch to the L2 or LLC
             if (MSHR.occupancy < (MSHR.SIZE>>1)){
             	RR_table_update(pf_address, 1);
-            	if(to_pref[1])
+            	if(to_pref[1]){
                 	prefetch_line(ip, addr, pf_address, FILL_L2);
+                	glob_count++;
+					pref_stats[1]++;
+            	}
             }
             else{
             	RR_table_update(pf_address, 1);
-                if(to_pref[1])
+                if(to_pref[1]){
                 	prefetch_line(ip, addr, pf_address, FILL_LLC);
+                	glob_count++;
+					pref_stats[1]++;
+                }
             }
         }
     }
@@ -343,8 +353,11 @@ void CACHE::sandbox_operate(uint64_t addr, uint64_t ip, uint8_t cache_hit, uint8
 			// for prefetching in positive direction (positive offset)
 			while(prefetches_allowed_pos>0 && total_pos<MAX_PREFETCHES) {
 				uint64_t prefetch_addr = (line_addr + prefetches_allowed_pos*itr->first) << LOG2_BLOCK_SIZE;
-				if(to_pref[2])
+				if(to_pref[2]){
 					prefetch_line(ip, addr, prefetch_addr , FILL_L2);
+					glob_count++;
+					pref_stats[2]++;
+				}
 				RR_table_update(prefetch_addr, 2);
 				prefetches_allowed_pos--;
 				total_pos++;
@@ -368,8 +381,11 @@ void CACHE::sandbox_operate(uint64_t addr, uint64_t ip, uint8_t cache_hit, uint8
 				// for prefetching in negative direction (negative offset)
 				while(prefetches_allowed_neg>0 && total_neg<MAX_PREFETCHES) {
 					uint64_t prefetch_addr = (line_addr + prefetches_allowed_neg*itr->first) << LOG2_BLOCK_SIZE;
-					if(to_pref[2])
+					if(to_pref[2]){
 						prefetch_line(ip, addr, prefetch_addr , FILL_L2);
+						glob_count++;
+						pref_stats[2]++;
+					}
 					RR_table_update(prefetch_addr, 2);
 					prefetches_allowed_neg--;
 					total_neg++;
@@ -385,8 +401,11 @@ void CACHE::sandbox_operate(uint64_t addr, uint64_t ip, uint8_t cache_hit, uint8
 				// for prefetching in positive direction (positive offset)
 				while(prefetches_allowed_pos>0 && total_pos<MAX_PREFETCHES) {
 					uint64_t prefetch_addr = (line_addr + prefetches_allowed_pos*itr->first) << LOG2_BLOCK_SIZE;
-					if(to_pref[2])
+					if(to_pref[2]){
 						prefetch_line(ip, addr, prefetch_addr , FILL_L2);
+						glob_count++;
+						pref_stats[2]++;
+					}
 					RR_table_update(prefetch_addr, 2);
 					prefetches_allowed_pos--;
 					total_pos++;
@@ -399,8 +418,11 @@ void CACHE::sandbox_operate(uint64_t addr, uint64_t ip, uint8_t cache_hit, uint8
 				// for prefetching in positive direction (positive offset)
 				while(prefetches_allowed_neg>0 && total_pos<MAX_PREFETCHES) {
 					uint64_t prefetch_addr = (line_addr + prefetches_allowed_neg*itr2->first) << LOG2_BLOCK_SIZE;
-					if(to_pref[2])
+					if(to_pref[2]){
 						prefetch_line(ip, addr, prefetch_addr , FILL_L2);
+						glob_count++;
+						pref_stats[2]++;
+					}
 					RR_table_update(prefetch_addr, 2);
 					prefetches_allowed_neg--;
 					total_neg++;
@@ -443,8 +465,11 @@ void CACHE::BO_operate(uint64_t addr, uint64_t ip, uint8_t cache_hit, uint8_t ty
 
      if (prefetch_issued) {
      	RR_table_update((prefetch_issued << LOG2_BLOCK_SIZE), 3);
-        if(to_pref[3])
+        if(to_pref[3]){
        		prefetch_line(ip, addr, (prefetch_issued << LOG2_BLOCK_SIZE), FILL_L2);	// request prefetch 
+        glob_count++;
+		pref_stats[3]++;
+        }
      }
    } 
 }
@@ -487,8 +512,11 @@ void CACHE::VLDP_operate(uint64_t addr, uint64_t ip, uint8_t cache_hit, uint8_t 
 		buffer[dhb_entry].last_4_offsets[0] = (pref_addr & 0xFFF);
 		L2_PF_DEBUG(printf("pref_block = %x, prev_block = %lx, pref_addr: %lx, prev_addr = %lx\n",
 							pref_block, curr_block, pref_addr, addr));
-		if(to_pref[4])
+		if(to_pref[4]){
 			prefetch_line(ip, addr, pref_addr, FILL_L2);
+			glob_count++;
+			pref_stats[4]++;
+		}
 		RR_table_update(pref_addr, 4);
 		pred_delta = pref_block - curr_block;
 		return;
@@ -504,8 +532,11 @@ void CACHE::VLDP_operate(uint64_t addr, uint64_t ip, uint8_t cache_hit, uint8_t 
 		pref_block = (pref_addr >> LOG2_BLOCK_SIZE) & 0x3F;
 		L2_PF_DEBUG(printf("orig_addr = %lx, pref_addr: %lx, prev_addr = %lx access_addr = %lx\n",
 							orig_addr, pref_addr, (buffer[dhb_entry].page_num << LOG2_PAGE_SIZE) | (buffer[dhb_entry].last_4_offsets[0]), addr ));
-		if(to_pref[4])
+		if(to_pref[4]){
 			prefetch_line(ip, addr, pref_addr, FILL_L2);
+			glob_count++;
+			pref_stats[4]++;
+		}
 		RR_table_update(pref_addr, 4);
 	}
 
@@ -545,8 +576,11 @@ for(j=0; j<3; j++){
 	pref_block = (pref_addr >> LOG2_BLOCK_SIZE) & 0x3F;
 	L2_PF_DEBUG(printf("orig_addr = %lx, pref_block = %x, prev_block = %lx, pref_addr: %lx, prev_addr = %lx\n",
 						orig_addr, pref_block, curr_block, pref_addr, temp_addr));
-	if(to_pref[4])
-			prefetch_line(ip, addr, pref_addr, FILL_L2);
+	if(to_pref[4]){
+		prefetch_line(ip, addr, pref_addr, FILL_L2);
+		glob_count++;
+		pref_stats[4]++;
+	}
 	RR_table_update(pref_addr, 4);
 
 	for(i=3; i>0; i--)																// Shift offsets and add latest
@@ -656,8 +690,11 @@ void CACHE::KPCP_operate(uint64_t addr, uint64_t ip, uint8_t cache_hit, uint8_t 
             }
             else {
                 if (pf_buffer[cpu][i].conf >= FILL_THRESHOLD) { // Prefetch to the L2
-                    if(to_pref[5])
+                    if(to_pref[5]){
                     	prefetch_line(ip, addr, pf_addr, FILL_L2);
+                    	glob_count++;
+						pref_stats[5]++;
+                    }
                     RR_table_update(pf_addr, 5);
                         PF_inflight[cpu]++; 
                         if (warmup_complete[cpu])
@@ -678,8 +715,11 @@ void CACHE::KPCP_operate(uint64_t addr, uint64_t ip, uint8_t cache_hit, uint8_t 
                     
                 }
                 else if (pf_buffer[cpu][i].conf >= PF_THRESHOLD) { // Prefetch to the LLC
-                    if(to_pref[5])
+                    if(to_pref[5]){
                     	prefetch_line(ip, addr, pf_addr, FILL_LLC);
+                    	glob_count++;
+						pref_stats[5]++;
+                    }
                     RR_table_update(pf_addr, 5);
                         PF_inflight[cpu]++; 
                         if (warmup_complete[cpu])
@@ -709,8 +749,11 @@ void CACHE::stream_operate(uint64_t addr, uint64_t ip, uint8_t cache_hit, uint8_
 	if((pt[pt_entry].stream_hit_cnt)%5 == STREAM_THRESHOLD){			// if streaming threshold reached, prefetch stream
 		for(i=0; i<STREAM_PREFETCH_DEGREE; i++){
 			pref_addr = ((pt[pt_entry].addr >> LOG2_BLOCK_SIZE) + i + 1) << LOG2_BLOCK_SIZE;
-			if(to_pref[6])
+			if(to_pref[6]){
 				prefetch_line(ip, addr, pref_addr, FILL_L2);			// prefetch next N cache lines
+			glob_count++;
+			pref_stats[6]++;
+			}
 			RR_table_update(pref_addr, 6);
 			L1_PF_DEBUG(printf("addr: %lx\npref_addr: %lx pref_candidate: %x\n",
 						addr, pref_addr, i));
