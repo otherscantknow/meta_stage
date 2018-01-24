@@ -1,0 +1,1681 @@
+#include "cache.h"
+#include "kpcp.h"
+#include "vldp.h"
+#include "stream.h"
+#include "meta.h"
+
+uint64_t to_pref[NUM_PREFETCHERS],
+	score[NUM_PREFETCHERS],
+	num_pf_issued[NUM_PREFETCHERS],
+	final_score[NUM_PREFETCHERS],
+	comb_score[NUM_PREFETCHERS],
+	prefetcher_use[NUM_PREFETCHERS] = {0,1,0,1,1,1,0},
+	pref_stats[NUM_PREFETCHERS],
+	num_misses = 0;
+float accuracy[NUM_PREFETCHERS],
+	  useful_per_access[NUM_PREFETCHERS];
+
+void RR_table_update(uint64_t pf_addr, int pref_num){
+	RECENT_REQUEST_TABLE *table = L2_RR[0];
+	int index = TRUNCATE(pf_addr^(pf_addr>>RRINDEX),RRINDEX);	// gets index (8 LSB of the address)
+    int tag = TRUNCATE(pf_addr>>RRINDEX,RRTAG);		// gets tag (12 bits after the 8 LSB)
+    table[pref_num].tag[index] = tag;				// inserts tag into the table at index
+    table[pref_num].pref_req[index] = 1;
+}
+
+
+void CACHE::l2c_prefetcher_initialize() 
+{
+	int i;
+	for(i=0; i<NUM_PREFETCHERS; i++){
+		to_pref[i] = 0;
+		score[i] = 0;
+		num_pf_issued[i] = 0;
+		accuracy[i] = 0;
+		useful_per_access[i] = 0;
+		final_score[i] = 0;
+		comb_score[i] = 0;
+		pref_stats[i] = 0;
+	}
+	num_misses = 0;
+//ip_stride
+	for (i=0; i<IP_TRACKER_COUNT; i++)
+        trackers[i].lru = i;
+
+//sandbox
+    evaluate_prefetchers_initialize();
+	offset_scores_initialize();
+
+//BO_pref
+	rr_initialize();
+    offset_reset();
+    dq_initialize();
+
+//VLDP
+	for(int j=0 ; j<NUM_CPUS; j++)													// Initialize offset prefetch table
+	for(int i=0; i<NUM_OPT_ENTRIES; i++)
+		L2_OPT[j][i].first_page_offset = i;
+
+//kpcp
+    spp_pf_issued[cpu] = 0;
+    spp_pf_useful[cpu] = 0;
+    spp_pf_useless[cpu] = 0;
+
+    for (int i=0; i<L2C_MSHR_SIZE; i++) {
+        useful_depth[cpu][i] = 0;
+        useless_depth[cpu][i] = 0;
+    }
+
+    for (int i=0; i<L2_ST_SET; i++) {
+        for (int j=0; j<L2_ST_WAY; j++)
+            L2_ST[cpu][i][j].lru = j;
+    }
+
+    for (int i=0; i<L2_GHR_TRACK; i++)
+        L2_GHR[cpu][i].lru = i;
+
+    conf_counter[cpu] = 0;
+
+//stream
+    for(int i=0; i<NUM_ST_ENTRIES; i++){
+		L1_ST[cpu][i].lru = i;
+		L1_PF_DEBUG(printf("lru: %lx\n",
+						L1_ST[cpu][i].lru));
+	}
+}
+
+void CACHE::l2c_prefetcher_operate(uint64_t addr, uint64_t ip, uint8_t cache_hit, uint8_t type)
+{
+	RECENT_REQUEST_TABLE *table = L2_RR[cpu];
+	int prefetcher = -1;
+	int index = TRUNCATE(addr^(addr>>RRINDEX),RRINDEX);	// gets index (8 LSB of the address)
+    int tag = TRUNCATE(addr>>RRINDEX,RRTAG);		// gets tag (12 bits after the 8 LSB)
+
+// to_pref[6] = 1;
+for(int i=0; i<NUM_PREFETCHERS; i++)
+	if(table[i].tag[index] == tag && table[i].pref_req[index] == 1)
+		table[i].pref_useful[index] = 1;
+	// if(table[i].tag[index] == tag && cache_hit == 0 && to_pref[i] != 1)
+	// 	table[i].pref_useful[index] = 1;
+	// else if(table[i].tag[index] == tag && cache_hit == 1 && to_pref[i] == 1)
+	// 	table[i].pref_useful[index] = 1;
+
+
+if(num_misses == CHECK_SCORE){
+for(int i=0; i<NUM_PREFETCHERS; i++){
+	for(int j=0; j<NUM_RR_ENTRIES; j++){
+		score[i] += (table[i].pref_req[j] && table[i].pref_useful[j]);
+		num_pf_issued[i] += table[i].pref_req[j];
+	}
+	if(prefetcher_use[i] == 1)
+		comb_score[i] = (score[i]/2) + (comb_score[i]/2);
+	accuracy[i] = ((float)score[i])/num_pf_issued[i];
+	useful_per_access[i] = ((float)score[i])/CHECK_SCORE;
+	final_score[i] = (int)((accuracy[i] + useful_per_access[i])*100);
+	if(to_pref[i] == 1)
+		pref_stats[i] = pref_stats[i] + score[i];
+}
+
+	int max_score = 0, entry = 0;
+	for(int i=0; i<NUM_PREFETCHERS; i++)
+		if(comb_score[i] >= max_score){
+			max_score = comb_score[i];
+			entry = i;
+		}
+
+// printf("Prefetcher %d has started prefetching\n", entry+1);
+// printf("NL, ip_stride, SB, BO, VLDP, KPCP, stream\n");
+// for(int i=0; i<NUM_PREFETCHERS; i++)
+// 	printf("%lld ", score[i]);
+// printf("\n");
+// for(int i=0; i<NUM_PREFETCHERS; i++)
+// 	printf("%lld ", num_pf_issued[i]);
+// printf("\n");
+// for(int i=0; i<NUM_PREFETCHERS; i++)
+// 	printf("%f ", accuracy[i]);
+// printf("\n");
+// for(int i=0; i<NUM_PREFETCHERS; i++)
+// 	printf("%lld ", final_score[i]);
+// printf("\n");
+// for(int i=0; i<NUM_PREFETCHERS; i++)
+// 	printf("%lld ", comb_score[i]);
+// printf("\n");
+// printf("\n");
+
+for(int i=0; i<NUM_PREFETCHERS; i++){
+	score[i] = 0;
+	to_pref[i] = 0;
+	num_pf_issued[i] = 0;
+	for(int j=0; j<NUM_RR_ENTRIES; j++){
+		table[i].tag[j] = 0;
+		table[i].pref_req[j] = 0;
+		table[i].pref_useful[j] = 0;
+	}
+}
+
+to_pref[entry] = 1;
+num_misses = 0;
+
+}
+
+	next_line_operate(addr, ip, cache_hit, type);
+	ip_stride_operate(addr, ip, cache_hit, type);
+	sandbox_operate(addr, ip, cache_hit, type);
+	BO_operate(addr, ip, cache_hit, type);
+	VLDP_operate(addr, ip, cache_hit, type);
+	KPCP_operate(addr, ip, cache_hit, type);
+	stream_operate(addr, ip, cache_hit, type);
+
+if(cache_hit == 0)
+	num_misses++;
+
+}
+
+void CACHE::l2c_prefetcher_cache_fill(uint64_t addr, uint32_t set, uint32_t way, uint8_t prefetch, uint64_t evicted_addr)
+{
+// L2 FILL
+    uint64_t evicted_cl = evicted_addr >> LOG2_BLOCK_SIZE;
+
+    if (evicted_cl) {
+        // Clear bitmap
+        int l2_st_match = L2_ST_check(cpu, evicted_addr),
+            l2_st_idx = (evicted_addr >> LOG2_PAGE_SIZE) % st_prime, //L2_ST_PRIME,
+            evicted_block = evicted_cl & 0x3F;
+        SIGNATURE_TABLE *table = L2_ST[cpu][l2_st_idx];
+
+        if (l2_st_match >= 0) {
+            int evicted_depth = table[l2_st_match].depth[evicted_block];
+
+            if (table[l2_st_match].l2_pf[evicted_block]) {
+                if (table[l2_st_match].used[evicted_block] == 0) {
+                    spp_pf_useless[cpu]++;
+                    useless_depth[cpu][evicted_depth]++;
+
+                    L2_PF_DEBUG ( if (warmup_complete[cpu]) {
+                    cout << "Useless pf_addr: " << hex << evicted_cl << dec << " delta: " << table[l2_st_match].delta[evicted_block];
+                    cout << " depth: " << table[l2_st_match].depth[evicted_block] << endl; });
+
+                    // Notify sampler
+                    // notify_sampler(cpu, evicted_addr, evicted_dirty, 0);
+                }
+                // else
+                    // notify_sampler(cpu, evicted_addr, evicted_dirty, 1);
+            }
+            table[l2_st_match].l2_pf[evicted_block] = 0;
+            table[l2_st_match].used[evicted_block] = 0;
+        }
+    }
+}
+
+void CACHE::l2c_prefetcher_final_stats()
+{
+
+printf("\n");
+printf("PREF STATS\n");
+printf("NL: %d \n", pref_stats[0]);
+printf("IP_stride: %d \n", pref_stats[1]);
+printf("sandbox: %d \n", pref_stats[2]);
+printf("BO: %d \n", pref_stats[3]);
+printf("VLDP: %d \n", pref_stats[4]);
+printf("KPCP: %d \n", pref_stats[5]);
+printf("stream: %d \n", pref_stats[6]);
+printf("\n");
+
+}
+
+void CACHE::next_line_operate(uint64_t addr, uint64_t ip, uint8_t cache_hit, uint8_t type){
+	uint64_t pf_addr = ((addr>>LOG2_BLOCK_SIZE)+1) << LOG2_BLOCK_SIZE;
+	if(to_pref[0]){
+		prefetch_line(ip, addr, pf_addr, FILL_L2);
+		printf("at NL\n");
+	}
+	RR_table_update(pf_addr, 0);
+}
+void CACHE::ip_stride_operate(uint64_t addr, uint64_t ip, uint8_t cache_hit, uint8_t type){
+	uint64_t cl_addr = addr >> LOG2_BLOCK_SIZE,
+	    	 pf_address = 0;
+
+    int index = -1;
+    for (index=0; index<IP_TRACKER_COUNT; index++) {
+        if (trackers[index].ip == ip)
+            break;
+    }
+
+    // this is a new IP that doesn't have a tracker yet, so allocate one
+    if (index == IP_TRACKER_COUNT) {
+
+        for (index=0; index<IP_TRACKER_COUNT; index++) {
+            if (trackers[index].lru == (IP_TRACKER_COUNT-1))
+                break;
+        }
+
+        trackers[index].ip = ip;
+        trackers[index].last_cl_addr = cl_addr;
+        trackers[index].last_stride = 0;
+
+        //cout << "[IP_STRIDE] MISS index: " << index << " lru: " << trackers[index].lru << " ip: " << hex << ip << " cl_addr: " << cl_addr << dec << endl;
+
+        for (int i=0; i<IP_TRACKER_COUNT; i++) {
+            if (trackers[i].lru < trackers[index].lru)
+                trackers[i].lru++;
+        }
+        trackers[index].lru = 0;
+
+        return;
+    }
+
+    // sanity check
+    // at this point we should know a matching tracker index
+    if (index == -1)
+        assert(0);
+
+    // calculate the stride between the current address and the last address
+    // this bit appears overly complicated because we're calculating
+    // differences between unsigned address variables
+    int64_t stride = 0;
+    if (cl_addr > trackers[index].last_cl_addr)
+        stride = cl_addr - trackers[index].last_cl_addr;
+    else {
+        stride = trackers[index].last_cl_addr - cl_addr;
+        stride *= -1;
+    }
+
+    //cout << "[IP_STRIDE] HIT  index: " << index << " lru: " << trackers[index].lru << " ip: " << hex << ip << " cl_addr: " << cl_addr << dec << " stride: " << stride << endl;
+
+    // don't do anything if we somehow saw the same address twice in a row
+    if (stride == 0)
+        return;
+
+    // only do any prefetching if there's a pattern of seeing the same
+    // stride more than once
+    if (stride == trackers[index].last_stride) {
+
+        // do some prefetching
+        for (int i=0; i<IP_PREFETCH_DEGREE; i++) {
+            pf_address = (cl_addr + (stride*(i+1))) << LOG2_BLOCK_SIZE;
+
+            // only issue a prefetch if the prefetch address is in the same 4 KB page 
+            // as the current demand access address
+            if ((pf_address >> LOG2_PAGE_SIZE) != (addr >> LOG2_PAGE_SIZE))
+                break;
+
+            // check the MSHR occupancy to decide if we're going to prefetch to the L2 or LLC
+            if (MSHR.occupancy < (MSHR.SIZE>>1)){
+            	RR_table_update(pf_address, 1);
+            	if(to_pref[1])
+                	prefetch_line(ip, addr, pf_address, FILL_L2);
+            }
+            else{
+            	RR_table_update(pf_address, 1);
+                if(to_pref[1])
+                	prefetch_line(ip, addr, pf_address, FILL_LLC);
+            }
+        }
+    }
+
+    trackers[index].last_cl_addr = cl_addr;
+    trackers[index].last_stride = stride;
+
+    for (int i=0; i<IP_TRACKER_COUNT; i++) {
+        if (trackers[i].lru < trackers[index].lru)
+            trackers[i].lru++;
+    }
+    trackers[index].lru = 0;
+}
+void CACHE::sandbox_operate(uint64_t addr, uint64_t ip, uint8_t cache_hit, uint8_t type){
+	uint64_t line_addr = addr >> LOG2_BLOCK_SIZE;
+	int prefetches_allowed_neg=0, total_neg=0, prefetches_allowed_pos=0, total_pos=0;
+
+	// insert line address in sandbox
+	sandbox.insert(line_addr);
+
+	if(current_evaluation_offset<=16) {
+		candidate_evaluation(line_addr);
+	}
+
+	// Here, we prefetch only upto MAX_PREFETCHES for one direction, per L2 cache access. This is in consideration of the bandwidth 				requirements of the cores. Lower offsets and corresponding negative offsets are allowed to prefetch before the higher offsets.
+	auto itr2=candidate_prefetchers.begin();
+
+	if(itr2->first>0) { // all positive offsets (as set is sorted)
+		for(auto itr=candidate_prefetchers.begin(); itr!=candidate_prefetchers.end(); itr++) {		
+			prefetches_allowed_pos = itr->second;
+
+			// for prefetching in positive direction (positive offset)
+			while(prefetches_allowed_pos>0 && total_pos<MAX_PREFETCHES) {
+				uint64_t prefetch_addr = (line_addr + prefetches_allowed_pos*itr->first) << LOG2_BLOCK_SIZE;
+				if(to_pref[2])
+					prefetch_line(ip, addr, prefetch_addr , FILL_L2);
+				RR_table_update(prefetch_addr, 2);
+				prefetches_allowed_pos--;
+				total_pos++;
+			}
+		}	
+	}
+
+	else if(itr2->first<0){
+		auto itr=candidate_prefetchers.begin();
+		for(; itr!=candidate_prefetchers.end(); itr++) {		
+			if(itr->first>0) {
+				itr2=--itr;
+				break;
+			}
+		}
+		
+		if(itr==candidate_prefetchers.end()) {// all negative offsets 
+				for(auto itr=candidate_prefetchers.begin(); itr!=candidate_prefetchers.end(); itr++) {		
+				prefetches_allowed_neg = itr->second;
+
+				// for prefetching in negative direction (negative offset)
+				while(prefetches_allowed_neg>0 && total_neg<MAX_PREFETCHES) {
+					uint64_t prefetch_addr = (line_addr + prefetches_allowed_neg*itr->first) << LOG2_BLOCK_SIZE;
+					if(to_pref[2])
+						prefetch_line(ip, addr, prefetch_addr , FILL_L2);
+					RR_table_update(prefetch_addr, 2);
+					prefetches_allowed_neg--;
+					total_neg++;
+				}	
+			}
+		}
+	
+		// if some offsets are positive and other are negative, prefetch in each direction separately upto MAX_PREFETCHES, starting from 				minimum offsets
+		else {
+			for(; itr!=candidate_prefetchers.end(); itr++) {		
+				prefetches_allowed_pos = itr->second;
+
+				// for prefetching in positive direction (positive offset)
+				while(prefetches_allowed_pos>0 && total_pos<MAX_PREFETCHES) {
+					uint64_t prefetch_addr = (line_addr + prefetches_allowed_pos*itr->first) << LOG2_BLOCK_SIZE;
+					if(to_pref[2])
+						prefetch_line(ip, addr, prefetch_addr , FILL_L2);
+					RR_table_update(prefetch_addr, 2);
+					prefetches_allowed_pos--;
+					total_pos++;
+				}	
+			}
+
+			for(; itr2!=candidate_prefetchers.begin(); itr2--) {		
+				prefetches_allowed_neg = itr2->second;
+
+				// for prefetching in positive direction (positive offset)
+				while(prefetches_allowed_neg>0 && total_pos<MAX_PREFETCHES) {
+					uint64_t prefetch_addr = (line_addr + prefetches_allowed_neg*itr2->first) << LOG2_BLOCK_SIZE;
+					if(to_pref[2])
+						prefetch_line(ip, addr, prefetch_addr , FILL_L2);
+					RR_table_update(prefetch_addr, 2);
+					prefetches_allowed_neg--;
+					total_neg++;
+				}	
+			}
+		}
+
+	}
+}
+void CACHE::BO_operate(uint64_t addr, uint64_t ip, uint8_t cache_hit, uint8_t type){
+	uint64_t line_addr = addr >> LOG2_BLOCK_SIZE;
+   uint64_t prefetch_issued = 0;
+   int set = get_set(line_addr);
+   int way = get_way(addr,set);
+   int l2_hit, prefetched = 0;
+
+   if ((int)NUM_SET < (int) set) {
+        assert(0);
+   }
+
+   if ((int)NUM_WAY < (int)way) {
+        assert(0);
+   }
+
+   if(way>=0) { 
+	l2_hit=1;		// if way is positive, it is L2 hit
+   }
+  
+   if (l2_hit) {
+     prefetched = block[set][way].prefetch;		// prefetched=1 if addr is prefetch hit
+     block[set][way].prefetch = 0;			// reset prefetch bit  
+   } 
+
+   dq_pop();		// dequeue the addresses from delay queue to fill RR table
+
+   // Prefetch issued on L1 miss or prefecthed hit
+   if (! cache_hit || prefetched) {
+     learning_phase(line_addr);
+     prefetch_issued = issue_prefetch(line_addr);	// address of the next line to be prefetched
+
+     if (prefetch_issued) {
+     	RR_table_update((prefetch_issued << LOG2_BLOCK_SIZE), 3);
+        if(to_pref[3])
+       		prefetch_line(ip, addr, (prefetch_issued << LOG2_BLOCK_SIZE), FILL_L2);	// request prefetch 
+     }
+   } 
+}
+void CACHE::VLDP_operate(uint64_t addr, uint64_t ip, uint8_t cache_hit, uint8_t type){
+	int delta[4],
+		pref_block = 0,
+		dhb_entry,
+		pred_delta,
+		i, j, flag = 0;
+	uint64_t curr_page = addr >> LOG2_PAGE_SIZE,
+			 curr_block = (addr >> LOG2_BLOCK_SIZE) & 0x3F,
+			 pref_addr,
+			 temp_addr,
+			 orig_addr = addr,
+			 last_4_blocks[4];
+	DELTA_HISTORY_BUFFER *buffer = L2_DHB[cpu];
+
+	for(i=0; i<NUM_DHB_PAGES; i++)													// Check if offset is in DHB
+		for(j=0; j<4; j++)
+			if(((buffer[i].last_4_offsets[j] >> LOG2_BLOCK_SIZE) & 0x3F) == curr_block)
+				flag = 1;
+
+	if(cache_hit == 1 && flag == 0)													// Prefetch Activation Event if cache miss  
+		return;																		// or prefetched offset hit
+
+	dhb_entry = L2_DHB_update( cpu, addr);
+	for(i=0; i<4; i++)
+		// last_4_blocks[i] = (buffer[dhb_entry].last_4_offsets[i] >> LOG2_BLOCK_SIZE) & 0x3F;
+		delta[i] = buffer[dhb_entry].last_4_deltas[i];
+
+// for(i=0; i<3; i++)
+// 	delta[i] = last_4_blocks[i] - last_4_blocks[i+1];
+// delta[3] = 0;
+
+	if(buffer[dhb_entry].num_access == 1){
+		pref_block = L2_OPT_check( cpu, addr);										// First page access
+		if(pref_block == PREF_ERROR)												// Offset not found
+		return;
+		pref_addr = (curr_page << LOG2_PAGE_SIZE) | (pref_block << LOG2_BLOCK_SIZE);
+		buffer[dhb_entry].last_4_offsets[0] = (pref_addr & 0xFFF);
+		L2_PF_DEBUG(printf("pref_block = %x, prev_block = %lx, pref_addr: %lx, prev_addr = %lx\n",
+							pref_block, curr_block, pref_addr, addr));
+		if(to_pref[4])
+			prefetch_line(ip, addr, pref_addr, FILL_L2);
+		RR_table_update(pref_addr, 4);
+		pred_delta = pref_block - curr_block;
+		return;
+	}
+	else{
+		pred_delta = L2_DPT_check( cpu, delta, dhb_entry);			// DPT check
+		if(pred_delta == PREF_ERROR)												// pred_delta not found
+		return;
+		if(buffer[dhb_entry].last_4_offsets[0] == 0)
+			pref_addr = ((addr >> LOG2_BLOCK_SIZE) + pred_delta) << LOG2_BLOCK_SIZE;
+		else
+			pref_addr = ((addr >> LOG2_BLOCK_SIZE) + pred_delta) << LOG2_BLOCK_SIZE;
+		pref_block = (pref_addr >> LOG2_BLOCK_SIZE) & 0x3F;
+		L2_PF_DEBUG(printf("orig_addr = %lx, pref_addr: %lx, prev_addr = %lx access_addr = %lx\n",
+							orig_addr, pref_addr, (buffer[dhb_entry].page_num << LOG2_PAGE_SIZE) | (buffer[dhb_entry].last_4_offsets[0]), addr ));
+		if(to_pref[4])
+			prefetch_line(ip, addr, pref_addr, FILL_L2);
+		RR_table_update(pref_addr, 4);
+	}
+
+
+
+	for(i=3; i>0; i--)																// Shift offsets and add latest
+	    buffer[dhb_entry].last_4_offsets[i] = buffer[dhb_entry].last_4_offsets[i-1];
+	buffer[dhb_entry].last_4_offsets[0] = (pref_addr & 0xFFF);
+	for(i=3; i>0; i--){
+		delta[i] = delta[i-1];														// Store pred_delta
+		// buffer[dhb_entry].last_4_deltas[i] = buffer[dhb_entry].last_4_deltas[i-1];
+	}
+	delta[0] = pred_delta;
+	// buffer[dhb_entry].last_4_deltas[0] = pred_delta;
+	curr_block = pref_block;														// Update curr_block fro further prefetches
+
+	// addr = pref_addr;																// Update address too
+
+
+
+if(buffer[dhb_entry].num_access > 1 && cache_hit == 1)  							// If miss or first page access fetch 3 more
+	return;
+if(flag == 1)
+	return;
+
+if(cache_hit == 0)
+	L2_PF_DEBUG(printf("Miss, so prefetch 3 more\n"));
+if(buffer[dhb_entry].num_access == 1)
+	L2_PF_DEBUG(printf("First time page access, so prefetch 3 more\n"));
+
+for(j=0; j<3; j++){
+	pred_delta = L2_DPT_check( cpu, delta, dhb_entry);
+	if(pred_delta == PREF_ERROR)													// If pred_delta not found, return
+	return;
+	temp_addr = pref_addr;
+	pref_addr = ((pref_addr >> LOG2_BLOCK_SIZE) + pred_delta) << LOG2_BLOCK_SIZE;
+	pref_block = (pref_addr >> LOG2_BLOCK_SIZE) & 0x3F;
+	L2_PF_DEBUG(printf("orig_addr = %lx, pref_block = %x, prev_block = %lx, pref_addr: %lx, prev_addr = %lx\n",
+						orig_addr, pref_block, curr_block, pref_addr, temp_addr));
+	if(to_pref[4])
+			prefetch_line(ip, addr, pref_addr, FILL_L2);
+	RR_table_update(pref_addr, 4);
+
+	for(i=3; i>0; i--)																// Shift offsets and add latest
+	    buffer[dhb_entry].last_4_offsets[i] = buffer[dhb_entry].last_4_offsets[i-1];
+	buffer[dhb_entry].last_4_offsets[0] = (pref_addr & 0xFFF);
+	for(i=3; i>0; i--){
+		delta[i] = delta[i-1];														// Update delta array
+		// buffer[dhb_entry].last_4_deltas[i] = buffer[dhb_entry].last_4_deltas[i-1];
+	}
+	delta[0] = pred_delta;
+	// buffer[dhb_entry].last_4_deltas[0] = pred_delta;
+	curr_block = pref_block;														// Update current_block
+	addr = pref_addr;																// Update addr
+	}
+}
+void CACHE::KPCP_operate(uint64_t addr, uint64_t ip, uint8_t cache_hit, uint8_t type){
+    // Check ST
+    L2_ST_update(cpu, addr);
+
+    // Check ST
+    int l2_st_match = L2_ST_check(cpu, addr),
+        l2_st_idx = (addr >> LOG2_PAGE_SIZE) % st_prime, //L2_ST_PRIME,
+        curr_block = (addr >> LOG2_BLOCK_SIZE) & 0x3F;
+    int pf_signature = 0, first_hit = 0;
+
+    // Double check
+    if (l2_st_match == -1)
+        assert(0); // WE SHOULD NOT REACH HERE
+
+    // Reset prefetch buffers
+    MAX_CONF[cpu] = 99;
+    num_pf[cpu] = 0; curr_conf[cpu] = 0; curr_delta[cpu] = 0;
+    PF_inflight[cpu] = 0;
+    out_of_page[cpu] = 0;
+    not_enough_conf[cpu] = 0;
+    for (int i=0; i<L2C_MSHR_SIZE; i++) {
+        pf_buffer[cpu][i].delta = 0;
+        pf_buffer[cpu][i].signature = 0;
+        pf_buffer[cpu][i].conf = 0;
+        pf_buffer[cpu][i].depth = 0;
+    }
+
+    // Check bitmap
+    // Mark bitmap (demand)
+    if (L2_ST[cpu][l2_st_idx][l2_st_match].l2_pf[curr_block] && (L2_ST[cpu][l2_st_idx][l2_st_match].used[curr_block] == 0)) {
+        spp_pf_useful[cpu]++;
+        useful_depth[cpu][L2_ST[cpu][l2_st_idx][l2_st_match].depth[curr_block]]++;
+
+        /*
+        // Notify sampler
+        int set = mlc_get_set(addr);
+        int way = mlc_get_way(cpu, addr, set);
+        notify_sampler(cpu, addr, mlc_cache[cpu][set][way].dirty, 3, L2_ST[cpu][l2_st_idx][l2_st_match].signature);
+        */
+    }
+    L2_ST[cpu][l2_st_idx][l2_st_match].used[curr_block] = 1;
+
+    // Dynamically update MAX_CONF (measured by ST) 
+    if (spp_pf_issued[cpu])
+        MAX_CONF[cpu] = (100*spp_pf_useful[cpu])/spp_pf_issued[cpu];
+
+    if (MAX_CONF[cpu] >= 99)
+        MAX_CONF[cpu] = 99;
+
+    // Search for prefetch candidate when we have a non-zero signature
+    pf_signature = L2_ST[cpu][l2_st_idx][l2_st_match].signature;
+    first_hit = L2_ST[cpu][l2_st_idx][l2_st_match].first_hit;
+    if (pf_signature && (first_hit == 0))
+        PF_check(cpu, pf_signature, curr_block);
+
+    // Request prefetch
+    uint64_t pf_addr = 0;
+    int pf_block = 0;
+    if (warmup_complete[cpu])
+    L2_PF_DEBUG(printf("pf_delta: "));
+    for (int i=0; i<num_pf[cpu]; i++) {
+        if (pf_buffer[cpu][i].delta == 0) {
+            printf("pf_delta[%d][%d]: %d  num_pf_delta: %d\n", cpu, i, pf_buffer[cpu][i].delta, num_pf[cpu]);
+            assert(0);
+        }
+        else {
+            if (warmup_complete[cpu])
+            L2_PF_DEBUG(printf("%d ", pf_buffer[cpu][i].delta));
+        }
+    }
+    if (warmup_complete[cpu])
+    L2_PF_DEBUG(printf("\n"));
+
+    for (int i=0; i<num_pf[cpu]; i++) {
+        if (pf_buffer[cpu][i].delta == 0) { 
+            printf("pf_delta[%d][%d]: %d  num_pf_delta: %d\n", cpu, i, pf_buffer[cpu][i].delta, num_pf[cpu]);
+            assert(0);
+        }
+        else {
+            // Actual prefetch request, calculate prefetch address
+            pf_addr = ((addr >> LOG2_BLOCK_SIZE) + pf_buffer[cpu][i].delta) << LOG2_BLOCK_SIZE;
+            pf_block = (pf_addr >> LOG2_BLOCK_SIZE) & 0x3F;
+
+            // Check bitmap
+            int l2_pf = L2_ST[cpu][l2_st_idx][l2_st_match].l2_pf[pf_block],
+                l2_demand = L2_ST[cpu][l2_st_idx][l2_st_match].used[pf_block];
+            
+            //if (bitmap_check)
+            if (l2_pf || l2_demand) {
+                if (warmup_complete[cpu])
+                L2_PF_DEBUG(printf("Prefetch is filtered  key: %lx\n", pf_addr >> LOG2_BLOCK_SIZE));
+            }
+            else {
+                if (pf_buffer[cpu][i].conf >= FILL_THRESHOLD) { // Prefetch to the L2
+                    if(to_pref[5])
+                    	prefetch_line(ip, addr, pf_addr, FILL_L2);
+                    RR_table_update(pf_addr, 5);
+                        PF_inflight[cpu]++; 
+                        if (warmup_complete[cpu])
+                        L2_PF_DEBUG(printf("L2_PREFETCH  cpu: %d base_cl: %lx pf_cl: %lx delta: %d d_sig: %x pf_sig: %x depth: %d conf: %d\n",
+                                    cpu, addr >> LOG2_BLOCK_SIZE, pf_addr >> LOG2_BLOCK_SIZE, pf_buffer[cpu][i].delta, 
+                                    pf_buffer[cpu][i].signature, pf_buffer[cpu][i].conf, pf_buffer[cpu][i].depth, pf_buffer[cpu][i].conf));
+
+                        // Mark bitmap (prefetch)
+                        L2_ST[cpu][l2_st_idx][l2_st_match].l2_pf[pf_block] = 1;
+                        L2_ST[cpu][l2_st_idx][l2_st_match].delta[pf_block] = ((int64_t)pf_addr >> LOG2_BLOCK_SIZE) - ((int64_t)addr >> LOG2_BLOCK_SIZE);
+                        L2_ST[cpu][l2_st_idx][l2_st_match].depth[pf_block] = PF_inflight[cpu];
+
+                        spp_pf_issued[cpu]++;
+                        if (spp_pf_issued[cpu] > GC_MAX) {
+                            spp_pf_issued[cpu] /= 2;
+                            spp_pf_useful[cpu] /= 2;
+                        }
+                    
+                }
+                else if (pf_buffer[cpu][i].conf >= PF_THRESHOLD) { // Prefetch to the LLC
+                    if(to_pref[5])
+                    	prefetch_line(ip, addr, pf_addr, FILL_LLC);
+                    RR_table_update(pf_addr, 5);
+                        PF_inflight[cpu]++; 
+                        if (warmup_complete[cpu])
+                        L2_PF_DEBUG(printf("LLC_PREFETCH cpu: %d base_cl: %lx pf_cl: %lx delta: %d d_sig: %x pf_sig: %x depth: %d conf: %d\n",
+                                    cpu, addr >> LOG2_BLOCK_SIZE, pf_addr >> LOG2_BLOCK_SIZE, pf_buffer[cpu][i].delta, 
+                                    pf_buffer[cpu][i].signature, pf_buffer[cpu][i].conf, pf_buffer[cpu][i].depth, pf_buffer[cpu][i].conf));
+                    
+                }
+            }
+        }
+    }
+
+    if (warmup_complete[cpu])
+    L2_PF_DEBUG(printf("\n"));
+}
+void CACHE::stream_operate(uint64_t addr, uint64_t ip, uint8_t cache_hit, uint8_t type){
+	STREAM_TABLE *pt = L1_ST[cpu];
+	int pt_entry = 0,i;
+	uint64_t expected_addr,
+			 pref_addr,
+			 index;
+	uint32_t set = get_set(addr);
+	uint32_t way = get_way(addr, set);
+	uint64_t data = block[set][way].data;							// get the data in the addr, this is for index B[i]
+
+	pt_entry = L1_ST_update(cpu, ip, addr);							// update the stream table and get the entry
+	if((pt[pt_entry].stream_hit_cnt)%5 == STREAM_THRESHOLD){			// if streaming threshold reached, prefetch stream
+		for(i=0; i<STREAM_PREFETCH_DEGREE; i++){
+			pref_addr = ((pt[pt_entry].addr >> LOG2_BLOCK_SIZE) + i + 1) << LOG2_BLOCK_SIZE;
+			if(to_pref[6])
+				prefetch_line(ip, addr, pref_addr, FILL_L2);			// prefetch next N cache lines
+			RR_table_update(pref_addr, 6);
+			L1_PF_DEBUG(printf("addr: %lx\npref_addr: %lx pref_candidate: %x\n",
+						addr, pref_addr, i));
+		}
+	}
+}
+
+
+//sandbox
+void evaluate_prefetchers_initialize() { // called only once
+	int i;
+	for(i=-8 ; i<=8; i++) {
+		if (i==0) {
+			continue;
+		}
+		evaluate_offsets.insert(i);
+	}
+}
+
+void offset_scores_initialize() { // called only once
+	for (set<int>:: iterator itr = evaluate_offsets.begin(); itr != evaluate_offsets.end(); ++itr) {
+		pair<int, int> p;
+		p.first = *itr;
+		p.second = 0;
+		offset_scores.insert(p);
+	}
+}
+
+/*
+	Function to reset the offset scores for offsets being evaluated in current round, called every new round
+*/
+void offset_scores_reset() { 
+
+	for (auto itr = evaluate_offsets.begin(); itr != evaluate_offsets.end(); ++itr) {
+		pair<int, int> p;
+		p.first = *itr;			// sets offset value
+		p.second = 0;				// sets initial score to 0
+	
+		// check for pairs with same offset value and remove the pairs with non-zero initial score
+		for(auto itr2 = offset_scores.begin() ; itr2!= offset_scores.end(); itr2++) {
+			if(itr2->first == p.first) {
+				offset_scores.erase(itr2);
+				break;
+			}
+		}
+		offset_scores.insert(p);
+  }
+
+}
+
+/* 
+	Function to check if the given line address exists in the sandbox
+*/
+bool sandbox_exists(uint64_t line_addr) {
+	if (line_addr == 0) { // control should not reach here
+    assert(0);
+  }
+
+	if(sandbox.find(line_addr) != sandbox.end())
+		return true;
+	return false;
+}
+
+/*
+	Function to clear the values in the sandbox for evaluation of new offset. This ensures that there is no cross-contamination between 		candidates sharing the sandbox.
+*/
+void sandbox_clear() {
+	for(auto itr = sandbox.begin(); itr != sandbox.end(); itr++ ) {
+		itr = sandbox.erase(itr);
+	}
+}
+
+/*
+	This function is called after evaluation of one offset is complete. If the offset scores are higher than a threshold, then the offset is 		a candidate prefetcher which can be used for actual prefetches from main memory. The number of streams prefetched depends on the range 	in which it's score lies.
+*/
+void select_candidate_prefetchers(int offset, int score) {
+
+		if(score >= PF3_ACCURACY) {
+			// issue maximum 3 prefetches
+			candidate_prefetchers.insert( pair<int,int>(offset, 3));		
+		}
+		else if(score >= PF2_ACCURACY) {
+			// issue maximum 2 prefetches
+			candidate_prefetchers.insert( pair<int,int>(offset, 2));
+		}
+		else if(score >= PF1_ACCURACY) {
+			// issue maximum 1 prefetch
+			candidate_prefetchers.insert( pair<int,int>(offset, 1));
+		}
+	
+}
+
+/* 
+	Function for removing 4 offsets with lowest scores .
+*/
+void offset_scores_clear(){	
+	auto itr = offset_scores.begin();
+	int count=0;
+	int originalSize = distance(offset_scores.begin(),offset_scores.end());
+
+	while(count<5) {
+		discarded_offsets.insert(itr->first);
+		evaluate_offsets.erase(itr->first);
+		advance(itr,1);
+		count++;
+	}
+
+	itr = offset_scores.begin();
+    advance(itr, 4);
+
+    offset_scores.erase(offset_scores.begin(), itr);
+
+	int newSize = distance(offset_scores.begin(),offset_scores.end());
+    assert(newSize == (originalSize - 4));
+
+}
+
+/*
+	Function for adding 4 new offsets for evaluation.
+*/
+void evaluate_offsets_add_new() {
+	
+	evaluate_offsets.insert(last_max_offset+1);
+	evaluate_offsets.insert(last_max_offset+2);
+	evaluate_offsets.insert(-1*last_max_offset-1);
+	evaluate_offsets.insert(-1*last_max_offset-2);
+	
+	current_evaluation_offset= -1*last_max_offset-2;
+	last_max_offset+=2;
+
+}
+
+/*
+	Function for evaluation of current_evaluation_offset for number of hits in the sandbox.
+*/
+void candidate_evaluation(uint64_t line_addr) {
+	
+	// if number of L2 accesses is less than maximum number, check for strided stream
+	if(l2_access_counter < MAX_L2_ACCESSES) {
+		if(sandbox_exists(line_addr)) {
+			current_offset_score++;
+		} 
+		if(sandbox_exists(line_addr - current_evaluation_offset)) {
+			current_offset_score++;
+		}
+		if(sandbox_exists(line_addr - 2*current_evaluation_offset)) {
+			current_offset_score++;
+		}
+		if(sandbox_exists(line_addr - 3*current_evaluation_offset)) {
+			current_offset_score++;
+		}
+
+		// increment number of L2 accesses by 1
+		l2_access_counter++;
+	}	
+	
+	// if number of L2 accesses reaches the threshold, either evaluation of current_evaluation_offset is over or the round is over
+	if(l2_access_counter == MAX_L2_ACCESSES) {
+		
+			// add current_evaluation_offset and current_offset_score to offset_scores and evaluate if this offset can be used for actual 			prefetching from main memory
+			pair<int, int> p;
+			p.first = current_evaluation_offset;
+			p.second = current_offset_score;
+			offset_scores.insert(p);
+
+			select_candidate_prefetchers(current_evaluation_offset,current_offset_score);
+
+			sandbox_clear();
+
+			l2_access_counter=0;
+	
+		// if there are still offsets to be evaluated, advance to the next offset and set current_evaluation_offset to that offset
+		if( (evaluate_offsets.find(current_evaluation_offset)) != evaluate_offsets.end() ) {
+			auto offset = evaluate_offsets.find(current_evaluation_offset);
+			advance(offset,1);
+			if(offset != evaluate_offsets.end()) {
+				current_evaluation_offset = *(offset);
+				current_offset_score = 0;
+			}
+			// else the round is over, reset offset scores
+			 else {
+				l2_access_counter=0;
+				offset_scores_clear();
+				evaluate_offsets_add_new();
+				offset_scores_reset();
+			}
+		}
+	}	
+}
+
+
+
+
+//BO_pref
+void rr_initialize() {
+   int i;
+   for (i=0; i<(1<<RRINDEX); i++) {
+      recent_request[i] = 0;
+   }
+}
+
+void rr_insert(uint64_t addr) {
+   int index = TRUNCATE(addr^(addr>>RRINDEX),RRINDEX);	// gets index (8 LSB of the address)
+   int tag = TRUNCATE(addr>>RRINDEX,RRTAG);		// gets tag (12 bits after the 8 LSB)
+   recent_request[index] = tag;				// inserts tag into the table at index
+}
+
+int rr_hit(uint64_t addr) {
+   int index = TRUNCATE(addr^(addr>>RRINDEX),RRINDEX);	// computes index of the address addr
+   int tag = TRUNCATE(addr>>RRINDEX,RRTAG);		// computes tag of the address addr
+   return (recent_request[index]==tag); 		// returns true if addr is present in RR table
+ }
+
+/* --------------------- OFFSET SCORES -------------------------- */
+
+void offset_reset() {
+  int i;
+  for (i=0; i<BO_NOFFSETS; i++) {
+    offset_score.score[i] = 0;
+  }
+  offset_score.max_score = 0;
+  offset_score.best_offset = 0;
+  offset_score.round = 0;
+  offset_score.last = 0;
+}
+
+/* --------------------- DELAY QUEUE -------------------------- */
+
+void dq_initialize() {
+  int i;
+  for (i=0; i<DELAYQSIZE; i++) {
+    delay_q.lineaddr[i] = 0;
+    delay_q.valid[i] = 0;
+  }
+  delay_q.tail = 0;
+  delay_q.head = 0;
+}
+
+
+void dq_push(uint64_t addr) {
+  // returns true if delay queue is full 
+  if (delay_q.valid[delay_q.tail]) {
+    rr_insert(delay_q.lineaddr[delay_q.head]);		// enqueue the oldest address from the queue 
+    delay_q.valid[delay_q.head] = 0;			// mark the slot in delay queue available
+    INCREMENT(delay_q.head,DELAYQSIZE);			// update head of delay queue 
+  }
+  // when delay queue is not full
+  if (delay_q.valid[delay_q.tail] != 0) {
+  	assert(0);
+  }
+  delay_q.lineaddr[delay_q.tail] = TRUNCATE(addr,RRINDEX+RRTAG);	// add appropriate addr bits to delay queue	
+  delay_q.valid[delay_q.tail] = 1;			// mark the slot in delay queue filled
+  INCREMENT(delay_q.tail,DELAYQSIZE);			// update tail of delay queue
+}
+
+/* 
+   Function to check if delay queue is empty
+*/
+int dq_ready() {
+  if (! delay_q.valid[delay_q.head]) {
+    return 0;
+  }
+  return 1;
+}
+
+/*
+   Function to dequeue the addresses in the delay queue and fill the RR table
+*/
+void dq_pop() {
+  // check if delay queue is empty
+  if (! dq_ready()) {
+    return;
+  }
+  while(delay_q.head != delay_q.tail) {
+    if (delay_q.valid[delay_q.head] == 0) {
+	assert(0);
+    }
+    rr_insert(delay_q.lineaddr[delay_q.head]);		// insert into RR table
+    delay_q.valid[delay_q.head] = 0;			// mark slot in delay queue empty
+    INCREMENT(delay_q.head,DELAYQSIZE);			// update head of delay queue
+  }
+}
+
+/* --------------------- BEST OFFSET LEARNING -------------------------- */
+
+void learning_phase(uint64_t addr) {
+  int last_index = offset_score.last;		// index of offset to be considered in the learning phase
+  int test_offset = OFFSET[last_index];
+  uint64_t test_addr = addr - test_offset;	// obtaining base address by subtracting offset from addr
+
+  // if addr and base address are in same page and addr is present in RR table, increment offset score for test_offset
+  if (SAMEPAGE(addr,test_addr) && rr_hit(test_addr)) {
+    offset_score.score[last_index]++;
+    
+    // if offset score of test_offset is greater than maximum for that learning phase, update max_score
+    if (offset_score.score[last_index] >= offset_score.max_score) {
+      offset_score.max_score = offset_score.score[last_index];
+      offset_score.best_offset = test_offset;		// update best offset for that learning phase
+    }
+  }
+
+  // increment last to index of next offset to be checked
+  INCREMENT(offset_score.last,BO_NOFFSETS); 
+
+  // end round if all offsets have been checked
+  if (last_index == (BO_NOFFSETS-1)) {
+    offset_score.round++;
+
+    // end learning phase if SCOREMAX or ROUNDMAX is reached
+    if ((offset_score.max_score == SCOREMAX) || (offset_score.round == ROUNDMAX)) {
+      // update the actual prefetch offset being used to best_offset if prefetch is on or to default if prefetch is off
+      prefetch_offset = (offset_score.best_offset != 0)? offset_score.best_offset : DEFAULT_OFFSET;
+
+      // prefetch throttle - if max score is less than BADSCORE, set prefetch offset being used to 0
+      if (offset_score.max_score <= BADSCORE) {
+	prefetch_offset = 0;
+      }
+      // reset offset table for new learning phase
+      offset_reset();
+      return;
+    }
+  }
+}
+
+/*
+   Function to get the address line to be prefetched next
+*/
+uint64_t issue_prefetch(uint64_t addr) {
+  // if addr and the address to be prefetched are on different pages, do not issue prefetch request, so return
+  if (! SAMEPAGE(addr, addr + prefetch_offset)) {
+    return 0;
+  }
+
+  if (addr == 0) { // control should not reach here
+    assert(0);
+  }
+  dq_push(addr);
+
+  // if prefetch_offset = 0, indicates that prefetcher is off
+  if (prefetch_offset == 0) {
+    return 0; 
+  }
+  
+  return (addr + prefetch_offset);		// return address to be prefetched
+}
+
+
+
+
+//VLDP
+int L2_DHB_update(uint32_t cpu,uint64_t addr)									// This is to update the delta history buffer
+{																				// Called when there is cache miss or prefetch hit
+	uint64_t page_num = addr >> LOG2_PAGE_SIZE,
+			 match = 0,
+	    	 curr_block = (addr >> LOG2_BLOCK_SIZE) & 0x3F;
+	int curr_delta = 0;
+	    DELTA_HISTORY_BUFFER *buffer = L2_DHB[cpu];
+	    for(match = 0; match < NUM_DHB_PAGES; match++){
+	    	if((buffer[match].num_access > 0) && (buffer[match].page_num == page_num)){ 		// DHB hit
+	    		curr_delta = curr_block - ((buffer[match].last_addr_offset >> LOG2_BLOCK_SIZE) & 0x3F);
+	    		for(int i=3; i>0; i--)												// Left shift the deltas
+	    			buffer[match].last_4_deltas[i] = buffer[match].last_4_deltas[i-1];
+	    		buffer[match].last_4_deltas[0] = curr_delta;						// Update latest delta
+	    		if(buffer[match].num_access == 1)            						// First DHB hit or sec access to page
+	    			L2_OPT_update(cpu, addr, (buffer[match].last_addr_offset >> LOG2_BLOCK_SIZE) & 0x3F);
+	    		else 
+	    			L2_DPT_update(cpu, addr, match);
+	    		break;
+	    	}
+	    }
+
+	    if(match == NUM_DHB_PAGES)												// DHB miss
+	    	for(match=0; match<NUM_DHB_PAGES; match++)
+	    		if(buffer[match].num_access == 0){								// Invalid entry, occurs at beginning
+	    			buffer[match].page_num = page_num;
+	    			break;
+	    		}
+
+	    if(match == NUM_DHB_PAGES)												// No DHB hits or no invalid entry found
+	    	for(match=0; match<NUM_DHB_PAGES; match++)							// DHB miss
+	    		if(buffer[match].mru == 0){										// evict nMRU
+	    			buffer[match].page_num = page_num;
+	    			buffer[match].last_pref_dpt_level = 1;						// Initialize all values in DHB entry
+					buffer[match].num_access = 0;	
+					for (int i=0; i<4; i++){
+						buffer[match].last_4_deltas[i] = 0;
+						buffer[match].last_4_offsets[i] = 0;}
+	    			break;
+	    		}
+
+	buffer[match].num_access++;													// Update last offset and num_access
+	buffer[match].last_addr_offset = addr & 0xFFF;
+
+	for(int i=0; i<NUM_DHB_PAGES; i++)
+		buffer[i].mru = 0;
+	buffer[match].mru = 1;														// Make mru
+
+if(match == NUM_DHB_PAGES){
+	assert(0);	
+}
+
+
+	return match;
+}
+
+void L2_OPT_update(uint32_t cpu, uint64_t addr, int last_block){				// Update offset prefetch table						
+	uint64_t curr_block = (addr >> LOG2_BLOCK_SIZE) & 0x3F;						// OPT is direct mapped
+	OFFSET_PRED_TABLE *table = L2_OPT[cpu];
+	if(table[last_block].pred_offset == curr_block)								// If prediction correct, make accuracy 1
+		table[last_block].accuracy = 1;
+	else{
+		if(table[last_block].accuracy == 1)
+			table[last_block].accuracy = 0;
+		else
+			table[last_block].pred_offset = curr_block;							// If accuracy already 0, update OPT entry
+		}
+}
+
+uint64_t L2_OPT_check(uint32_t cpu, uint64_t addr){								// Lookup OPT to get offset
+	uint64_t curr_block = (addr >> LOG2_BLOCK_SIZE) & 0x3F;
+	OFFSET_PRED_TABLE *table = L2_OPT[cpu];
+	if(table[curr_block].accuracy == 1)											// If accuracy 1, return offset
+		return table[curr_block].pred_offset;									// else return prefetch error
+	else 
+		return PREF_ERROR;
+}
+
+void L2_promote(uint32_t cpu, int entry, int table_num){
+	int match = -1,j=-1;
+	DELTA_PRED_TABLE_1 *table_1 = DPT_1[cpu];
+	DELTA_PRED_TABLE_2 *table_2 = DPT_2[cpu];
+	DELTA_PRED_TABLE_3 *table_3 = DPT_3[cpu];
+	DELTA_HISTORY_BUFFER *buffer = L2_DHB[cpu];
+
+//DPT_2
+if(table_num == 2){
+	for(match=0; match<NUM_DPT_ENTRIES; match++)
+		if(table_2[match].deltas[0] == buffer[entry].last_4_deltas[1] &&
+			table_2[match].deltas[1] == buffer[entry].last_4_deltas[2]){		// DPT_2 hit
+			if(table_2[match].pred_delta == buffer[entry].last_4_deltas[0]){	// Correct prediction
+				table_2[match].accuracy++;
+				if(table_2[match].accuracy > 3)
+					table_2[match].accuracy = 3;								// 2-bit accuracy
+				break;
+			}			
+			else{																// Wrong prediction
+				table_2[match].accuracy--;
+				if(table_2[match].accuracy == 0){								// If accuracy 0, promote
+					table_2[match].pred_delta = buffer[entry].last_4_deltas[0];
+					buffer[entry].last_pref_dpt_level = 3;						// promote to DPT_3
+					table_2[match].accuracy = 1;
+				}
+				break;
+			}
+
+		}
+	if(match == NUM_DPT_ENTRIES)												// If not hit, search for invalid entry
+		for(match=0; match<NUM_DPT_ENTRIES; match++)
+			if(table_2[match].pred_delta == 0){									// Invalid entry found
+				table_2[match].deltas[0] = buffer[entry].last_4_deltas[1];
+				table_2[match].deltas[1] = buffer[entry].last_4_deltas[2];
+				table_2[match].pred_delta = buffer[entry].last_4_deltas[0];
+				table_2[match].accuracy = 1;
+				break;
+			}
+	if(match == NUM_DPT_ENTRIES)												// Search for nMRU candidate
+		for(match=0; match<NUM_DPT_ENTRIES; match++)
+			if(table_2[match].mru == 0){										// Evict nMRU
+				table_2[match].deltas[0] = buffer[entry].last_4_deltas[1];
+				table_2[match].deltas[1] = buffer[entry].last_4_deltas[2];
+				table_2[match].pred_delta = buffer[entry].last_4_deltas[0];
+				table_2[match].accuracy = 1;
+				break;
+			}
+
+	for(int i=0; i<NUM_DPT_ENTRIES; i++)
+		table_2[i].mru = 0;
+	table_2[match].mru = 1;														// Make MRU
+	}
+
+//DPT_3
+if(table_num == 3){
+	for(match=0; match<NUM_DPT_ENTRIES; match++)
+		if(table_3[match].deltas[0] == buffer[entry].last_4_deltas[1] &&
+			table_3[match].deltas[1] == buffer[entry].last_4_deltas[2] &&
+			table_3[match].deltas[2] == buffer[entry].last_4_deltas[3]){		// DPT_2 hit
+			if(table_3[match].pred_delta == buffer[entry].last_4_deltas[0]){	// Correct prediction
+				table_3[match].accuracy++;
+				if(table_3[match].accuracy > 3)
+					table_3[match].accuracy = 3;								// 2-bit accuracy
+				break;
+			}			
+			else{																// Wrong prediction
+				table_3[match].accuracy--;
+				if(table_3[match].accuracy == 0){								// If accuracy 0, update
+					table_3[match].pred_delta = buffer[entry].last_4_deltas[0];
+					table_3[match].accuracy = 1;
+				}
+				break;
+			}
+
+		}
+	if(match == NUM_DPT_ENTRIES)												// If not hit, search for invalid entry
+		for(match=0; match<NUM_DPT_ENTRIES; match++)
+			if(table_3[match].pred_delta == 0){									// Invalid entry found
+				table_3[match].deltas[0] = buffer[entry].last_4_deltas[1];
+				table_3[match].deltas[1] = buffer[entry].last_4_deltas[2];
+				table_3[match].deltas[2] = buffer[entry].last_4_deltas[3];
+				table_3[match].pred_delta = buffer[entry].last_4_deltas[0];
+				table_3[match].accuracy = 1;
+				break;
+			}
+	if(match == NUM_DPT_ENTRIES)												// Search for nMRU candidate
+		for(match=0; match<NUM_DPT_ENTRIES; match++)
+			if(table_3[match].mru == 0){										// Evict nMRU
+				table_3[match].deltas[0] = buffer[entry].last_4_deltas[1];
+				table_3[match].deltas[1] = buffer[entry].last_4_deltas[2];
+				table_3[match].deltas[2] = buffer[entry].last_4_deltas[3];
+				table_3[match].pred_delta = buffer[entry].last_4_deltas[0];
+				table_3[match].accuracy = 1;
+				break;
+			}
+
+	for(int i=0; i<NUM_DPT_ENTRIES; i++)
+		table_3[i].mru = 0;
+	table_3[match].mru = 1;														// Make MRU
+	}
+}
+
+void L2_DPT_update(uint32_t cpu,uint64_t addr, int entry){						// Update the delta prefetch table
+	int match = -1,j=-1;
+	DELTA_PRED_TABLE_1 *table_1 = DPT_1[cpu];
+	DELTA_PRED_TABLE_2 *table_2 = DPT_2[cpu];
+	DELTA_PRED_TABLE_3 *table_3 = DPT_3[cpu];
+	DELTA_HISTORY_BUFFER *buffer = L2_DHB[cpu];
+
+//DPT_3
+if(buffer[entry].last_pref_dpt_level == 3){
+		for(match=0; match<NUM_DPT_ENTRIES; match++)
+			if(table_3[match].deltas[0] == buffer[entry].last_4_deltas[1] &&
+				table_3[match].deltas[1] == buffer[entry].last_4_deltas[2] &&
+				table_3[match].deltas[2] == buffer[entry].last_4_deltas[3]){		// DPT_2 hit
+				if(table_3[match].pred_delta == buffer[entry].last_4_deltas[0]){	// Correct prediction
+					table_3[match].accuracy++;
+					if(table_3[match].accuracy > 3)
+						table_3[match].accuracy = 3;								// 2-bit accuracy
+					break;
+				}			
+				else{																// Wrong prediction
+					table_3[match].accuracy--;
+					if(table_3[match].accuracy < 0)
+						table_3[match].accuracy = 0;
+					if(table_3[match].accuracy == 0){								// If accuracy 0, update
+						table_3[match].pred_delta = buffer[entry].last_4_deltas[0];
+						table_3[match].accuracy = 1;
+					}
+					break;
+				}
+
+			}
+		if(match == NUM_DPT_ENTRIES)												// If not hit, search for invalid entry
+			buffer[entry].last_pref_dpt_level--;
+		else{
+			for(int i=0; i<NUM_DPT_ENTRIES; i++)
+				table_3[i].mru = 0;
+			table_3[match].mru = 1;	
+		}
+																// Make MRU
+	}
+// 1,2,3,5,2,4,1,2,3,5,2,4,1,2,3,5,2,4,1,2,3,5,2,4,
+//DPT_2
+	if(buffer[entry].last_pref_dpt_level == 2){
+		for(match=0; match<NUM_DPT_ENTRIES; match++)
+			if(table_2[match].deltas[0] == buffer[entry].last_4_deltas[1] &&
+				table_2[match].deltas[1] == buffer[entry].last_4_deltas[2]){		// DPT_2 hit
+				if(table_2[match].pred_delta == buffer[entry].last_4_deltas[0]){	// Correct prediction
+					table_2[match].accuracy++;
+					if(table_2[match].accuracy > 3)
+						table_2[match].accuracy = 3;								// 2-bit accuracy
+					break;
+				}			
+				else{																// Wrong prediction
+					table_2[match].accuracy--;
+					if(table_2[match].accuracy == 0){								// If accuracy 0, promote
+						table_2[match].pred_delta = buffer[entry].last_4_deltas[0];
+						buffer[entry].last_pref_dpt_level = 3;						// promote to DPT_3
+						L2_promote(cpu, entry, 3);
+						table_2[match].accuracy = 1;
+					}
+					break;
+				}
+
+			}
+		if(match == NUM_DPT_ENTRIES)												// If not hit, search for invalid entry
+			buffer[entry].last_pref_dpt_level--;
+		else{
+			for(int i=0; i<NUM_DPT_ENTRIES; i++)
+			table_2[i].mru = 0;
+		table_2[match].mru = 1;	
+		}													// Make MRU
+		}
+
+//DPT_1
+	if(buffer[entry].last_pref_dpt_level == 1){											// Start with level 1 DPT
+		for(match=0; match<NUM_DPT_ENTRIES; match++)
+			if(table_1[match].deltas[0] == buffer[entry].last_4_deltas[1]){				// DPT_1 hit
+				if(table_1[match].pred_delta == buffer[entry].last_4_deltas[0]){		// Correct prediction
+					table_1[match].accuracy++;
+					if(table_1[match].accuracy > 3)
+						table_1[match].accuracy = 3;									// 2-bit accuracy
+					break;
+				}			
+				else{																	// Wrong prediction
+					table_1[match].accuracy--;											
+					if(table_1[match].accuracy == 0){									// If accuracy 0, promote
+						table_1[match].pred_delta = buffer[entry].last_4_deltas[0];
+						buffer[entry].last_pref_dpt_level = 2;							// promote to DPT_2
+						L2_promote(cpu, entry, 2);
+						table_1[match].accuracy = 1;
+					}
+					break;
+				}
+
+			}
+		if(match == NUM_DPT_ENTRIES)												// If not hit, search for invalid entry
+			for(match=0; match<NUM_DPT_ENTRIES; match++)
+				if(table_1[match].pred_delta == 0){									// Invalid entry found
+					table_1[match].deltas[0] = buffer[entry].last_4_deltas[1];
+					table_1[match].pred_delta = buffer[entry].last_4_deltas[0];
+					table_1[match].accuracy = 1;
+					break;
+				}
+		if(match == NUM_DPT_ENTRIES)												// Search for nMRU candidate
+			for(match=0; match<NUM_DPT_ENTRIES; match++)
+				if(table_1[match].mru == 0){										// Evict nMRU
+					table_1[match].deltas[0] = buffer[entry].last_4_deltas[1];
+					table_1[match].pred_delta = buffer[entry].last_4_deltas[0];
+					table_1[match].accuracy = 1;
+					break;
+				}
+
+		for(int i=0; i<NUM_DPT_ENTRIES; i++)
+			table_1[i].mru = 0;
+		table_1[match].mru = 1;														// Make MRU
+		}
+
+// buffer[entry].last_pref_dpt_level = 1;												// Make DPT_level 1 for updating again
+}
+
+int L2_DPT_check(uint32_t cpu, int *delta, int entry){											// Search DPT for delta
+	int i;
+	DELTA_PRED_TABLE_1 *table_1 = DPT_1[cpu];
+	DELTA_PRED_TABLE_2 *table_2 = DPT_2[cpu];
+	DELTA_PRED_TABLE_3 *table_3 = DPT_3[cpu];
+	DELTA_HISTORY_BUFFER *buffer = L2_DHB[cpu];
+
+for(i=0; i<NUM_DPT_ENTRIES; i++)
+	if(table_3[i].deltas[0] == delta[0] && table_3[i].deltas[0] !=0 &&
+		table_3[i].deltas[1] == delta[1] &&	table_3[i].deltas[1] !=0 &&					// Priority given to 3-delta DPT first
+		table_3[i].deltas[2] == delta[2] && table_3[i].deltas[2] !=0 ){
+		L2_PF_DEBUG(printf("3_Delta = %d,%d,%d:%d\n", 
+								delta[2], delta[1], delta[0], table_3[i].pred_delta));
+		buffer[entry].last_pref_dpt_level = 3;
+		return table_3[i].pred_delta;}												// Return dpt_3 delta
+
+for(i=0; i<NUM_DPT_ENTRIES; i++)
+	if(table_2[i].deltas[0] == delta[0] && table_2[i].deltas[0] != 0 &&
+		table_2[i].deltas[1] == delta[1] && table_2[i].deltas[1] != 0){											// Search dpt_2 next
+		L2_PF_DEBUG(printf("2_Delta = %d,%d:%d\n", 
+								delta[1], delta[0], table_2[i].pred_delta));
+		buffer[entry].last_pref_dpt_level = 2;
+		return table_2[i].pred_delta;}												// Return dpt_3 delta
+
+for(i=0; i<NUM_DPT_ENTRIES; i++)
+	if(table_1[i].deltas[0] == delta[0] && table_1[i].deltas[0] != 0){					// Search dpt_1 next
+		L2_PF_DEBUG(printf("1_Delta = %d:%d\n", delta[0], table_1[i].pred_delta));
+		buffer[entry].last_pref_dpt_level = 1;
+		return table_1[i].pred_delta;}												// Return dpt_1 delta
+
+	return PREF_ERROR;																// Else return prefetch error
+}
+
+//KPCP
+void GHR_update(uint32_t cpu, int signature, int path_conf, int last_block, int oop_delta)
+{
+    int match;
+	for (match=0; match<L2_GHR_TRACK; match++)  {
+        if (L2_GHR[cpu][match].signature == signature) { // Hit
+
+            // Update metadata
+            L2_GHR[cpu][match].signature = signature;
+            L2_GHR[cpu][match].path_conf = path_conf;
+            L2_GHR[cpu][match].last_block = last_block;
+            L2_GHR[cpu][match].oop_delta = oop_delta;
+
+            break;
+        }
+    }
+
+    if (match == L2_GHR_TRACK) {
+        for (match=0; match<L2_GHR_TRACK; match++) {
+            if (L2_GHR[cpu][match].signature == 0) { // Invalid
+
+                // Update metadata
+                L2_GHR[cpu][match].signature = signature;
+                L2_GHR[cpu][match].path_conf = path_conf;
+                L2_GHR[cpu][match].last_block = last_block;
+                L2_GHR[cpu][match].oop_delta = oop_delta;
+
+                break;
+            }
+        }
+	}
+
+    if (match == L2_GHR_TRACK) { // Miss
+
+		// Search for LRU victim
+        int max_idx = -1;
+        int max_lru = 0;
+        for (match=0; match<L2_GHR_TRACK; match++) {
+            if (L2_GHR[cpu][match].lru >= max_lru) {
+                max_idx = match;
+                max_lru = L2_GHR[cpu][match].lru;
+            }
+        }
+        match = max_idx;
+
+        // Update metadata
+        L2_GHR[cpu][match].signature = signature;
+        L2_GHR[cpu][match].path_conf = path_conf;
+        L2_GHR[cpu][match].last_block = last_block;
+        L2_GHR[cpu][match].oop_delta = oop_delta;
+    }
+
+    // Update LRU
+    int position = L2_GHR[cpu][match].lru;
+    for (int i=0; i<L2_GHR_TRACK; i++) {
+        if (L2_GHR[cpu][match].lru < position)
+            L2_GHR[cpu][match].lru++;
+    }
+    L2_GHR[cpu][match].lru = 0;
+
+    return;
+}
+
+int check_same_page(int curr_block, int delta)
+{
+    if ((0 <= (curr_block + delta)) && ((curr_block + delta) <= 63))
+        return 1;
+    else
+        return 0;
+}
+
+// Check prefetch candidate
+int PF_check(uint32_t cpu, int signature, int curr_block)
+{
+    int l2_pt_idx = signature % pt_prime; //L2_PT_PRIME;
+    PATTERN_TABLE *table = L2_PT[cpu][l2_pt_idx];
+    int pf_max = 0, pf_idx = -1, conf_max = 100, temp_conf = 100; 
+
+    if (table[0].c_sig) // This signature was updated at least once
+    {
+        // Search for prefetch candidates
+
+        for (int i=0; i<L2_PT_WAY; i++)
+        {
+            temp_conf = (100*table[i].c_delta)/table[0].c_sig;
+
+            if (temp_conf >= PF_THRESHOLD) // This delta entry has enough confidence
+            {
+                if (check_same_page(curr_block, table[i].delta)) // Safe to prefetch in page boundary
+                {
+                    pf_buffer[cpu][num_pf[cpu]].delta = table[i].delta;
+                    pf_buffer[cpu][num_pf[cpu]].signature = signature;
+                    pf_buffer[cpu][num_pf[cpu]].depth = 1;
+                    pf_buffer[cpu][num_pf[cpu]].conf = temp_conf;
+
+                    if (warmup_complete[cpu])
+                    L2_PF_DEBUG(printf("PF_buffer cpu: %d idx: %d delta: %d signature: %x depth: %d conf: %d\n",
+                                cpu, 0, pf_buffer[cpu][num_pf[cpu]].delta, pf_buffer[cpu][num_pf[cpu]].signature, 
+                                pf_buffer[cpu][num_pf[cpu]].depth, pf_buffer[cpu][num_pf[cpu]].conf));
+
+                    num_pf[cpu]++;
+                }
+                else // Store it in the GHR
+                {
+                    out_of_page[cpu]++;
+                    if (warmup_complete[cpu])
+                    L2_PF_DEBUG(printf("PT_sig: %4x PF_check OOP high_curr_conf: %d  way: %d  delta: %d  counter: %d / %d  MAX_CONF: %d\n", 
+                                signature, temp_conf, i, table[i].delta, table[i].c_delta, table[0].c_sig, MAX_CONF[cpu]));
+
+                    #ifdef L2_GHR_ON
+                    GHR_update(cpu, signature, temp_conf, curr_block, table[i].delta);
+                    #endif
+                }
+
+                // Track the maximum counter regardless of page boundary
+                if (pf_max < table[i].c_delta)
+                {
+                    pf_max = table[i].c_delta;
+                    pf_idx = i;
+                    conf_max = temp_conf;
+                }
+                if (warmup_complete[cpu])
+                L2_PF_DEBUG(printf("PT_sig: %4x PF_check candidate  high_curr_conf: %d  way: %d  delta: %d  counter: %d / %d  MAX_CONF: %d\n", 
+                            signature, temp_conf, i, table[i].delta, table[i].c_delta, table[i].c_sig, MAX_CONF[cpu]));
+            }
+            else
+            {
+                not_enough_conf[cpu]++;
+                if (warmup_complete[cpu])
+                L2_PF_DEBUG(printf("PT_sig: %4x PF_check no candidate  low_curr_conf: %d  way: %d  stride: %d  counter: %d / %d  MAX_CONF: %d\n", 
+                            signature, temp_conf, i, table[i].delta, table[i].c_delta, table[i].c_sig, MAX_CONF[cpu]));
+            }
+        }
+
+        // Update the path confidence
+        if (pf_idx >= 0)
+        {
+            curr_conf[cpu] = conf_max;
+            curr_delta[cpu] = table[pf_idx].delta;
+        }
+        else
+        {
+            curr_conf[cpu] = 0;
+            curr_delta[cpu] = 0;
+        }
+    }
+    else
+    {
+        curr_conf[cpu] = 0;
+        curr_delta[cpu] = 0;
+    }
+
+    #ifdef LOOKAHEAD_ON
+    int la_signature = signature, la_pf_max, la_pf_idx, LA_idx;
+    int last_delta = 0;
+
+    if (curr_conf[cpu] >= PF_THRESHOLD)
+    {
+        do
+        {
+            la_signature = get_new_signature(la_signature, curr_delta[cpu] - last_delta); 
+            la_pf_max = 0; la_pf_idx = -1;
+            LA_idx = la_signature % pt_prime; //L2_PT_PRIME;
+            table = L2_PT[cpu][LA_idx];
+            if (table[0].c_sig) // This signature was updated at least once
+            {
+                // Search for lookahead prefetch candidates
+
+                for (int i=0; i<L2_PT_WAY; i++)
+                {
+                    // Calculate path confidence
+                    temp_conf = curr_conf[cpu]*table[i].c_delta/table[0].c_sig*MAX_CONF[cpu]/100; 
+
+                    if (temp_conf >= PF_THRESHOLD) // This delta entry has enough confidence
+                    {
+                        // Track the maximum counter regardless of page boundary
+                        if (la_pf_max < table[i].c_delta)
+                        {
+                            la_pf_max = table[i].c_delta;
+                            la_pf_idx = i;
+                            conf_max = temp_conf;
+                        }
+                        if (warmup_complete[cpu])
+                        L2_PF_DEBUG(printf("PT_sig: %4x LA_check candidate  high_curr_conf: %d  way: %d  stride: %d  counter: %d / %d  MAX_CONF: %d\n", 
+                                    la_signature, temp_conf, i, table[i].delta, table[i].c_delta, table[0].c_sig, MAX_CONF[cpu]));
+                    }
+                    else
+                    {
+                        not_enough_conf[cpu]++;
+                        if (warmup_complete[cpu])
+                        L2_PF_DEBUG(printf("PT_sig: %4x LA_check no candidate  low_curr_conf: %d  way: %d  stride: %d  counter: %d / %d  MAX_CONF: %d\n", 
+                                    la_signature, temp_conf, i, table[i].delta, table[i].c_delta, table[0].c_sig, MAX_CONF[cpu]));
+                    }
+                }
+
+                // Update the path confidence
+                if (la_pf_idx >= 0) 
+                {
+                    if (num_pf[cpu] < L2C_MSHR_SIZE)
+                    {
+                        // Safe to prefetch in page boundary
+                        if (check_same_page(curr_block, curr_delta[cpu] + table[la_pf_idx].delta))
+                        {
+                            if (curr_delta[cpu] + table[la_pf_idx].delta)
+                            {
+                                pf_buffer[cpu][num_pf[cpu]].delta = curr_delta[cpu] + table[la_pf_idx].delta;
+                                pf_buffer[cpu][num_pf[cpu]].signature = la_signature;
+                                pf_buffer[cpu][num_pf[cpu]].depth = num_pf[cpu]+1;
+                                pf_buffer[cpu][num_pf[cpu]].conf = conf_max;
+                                num_pf[cpu]++;
+                            }
+                        }
+
+                        last_delta = curr_delta[cpu];
+                        curr_conf[cpu] = conf_max;
+                        curr_delta[cpu] += table[la_pf_idx].delta;
+                    }
+                    else
+                    {
+                        last_delta = curr_delta[cpu];
+                        curr_conf[cpu] = 0;
+                        curr_delta[cpu] = 0;
+                    }
+                }
+                else
+                {
+                    last_delta = curr_delta[cpu];
+                    curr_conf[cpu] = 0;
+                    curr_delta[cpu] = 0;
+                }
+            }
+            else
+            {
+                last_delta = curr_delta[cpu];
+                curr_conf[cpu] = 0;
+                curr_delta[cpu] = 0;
+            }
+        } while (curr_conf[cpu] >= PF_THRESHOLD);
+    }
+    #endif
+
+    return 0;
+}
+
+int L1_ST_update(uint32_t cpu, uint64_t ip, uint64_t addr) {								// stream table update
+	STREAM_TABLE *pt = L1_ST[cpu];
+	int match;
+
+	for(match=0; match<NUM_ST_ENTRIES; match++)
+		if(pt[match].pc == ip) {												// stream entry found using PC
+			pt[match].addr = addr;												// update latest address
+			pt[match].stream_hit_cnt++;
+			// if(pt[match].stream_hit_cnt >= STREAM_THRESHOLD)
+			break;
+		}
+	if(match == NUM_ST_ENTRIES)													// entry not found,
+		for(match=0; match<NUM_ST_ENTRIES; match++)								// search for invalid entry
+			if(pt[match].pc == 0) {
+				pt[match].pc = ip;
+				pt[match].addr = addr;
+				pt[match].stream_hit_cnt++;
+				break;
+			}
+
+	if (match == NUM_ST_ENTRIES) {												// invalid entry not found, search for lru victim
+        for (match=0; match<NUM_ST_ENTRIES; match++) {
+            if (pt[match].lru == (NUM_ST_ENTRIES-1))
+                break;
+        }
+        pt[match].pc = ip;														// update stream table
+		pt[match].addr = addr;
+		pt[match].stream_hit_cnt++;
+    }
+
+
+		// L1_PF_DEBUG(printf("Stream table stats \npc: %lx addr: %lx hit_cnt: %lx lru: %lx table entry: %lx\n",
+		// 				pt[match].pc, pt[match].addr, pt[match].stream_hit_cnt, pt[match].lru, match));
+
+    int position = pt[match].lru;												// update lru
+    for (int j=0; j<NUM_ST_ENTRIES; j++) {
+        if (pt[j].lru < position)
+            pt[j].lru++;
+    }
+    pt[match].lru = 0;
+    return match;
+}
