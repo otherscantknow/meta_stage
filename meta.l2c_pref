@@ -12,7 +12,8 @@ uint64_t to_pref[NUM_PREFETCHERS],
 	comb_score[NUM_PREFETCHERS],
 	prefetcher_use[NUM_PREFETCHERS] = {0,1,0,1,1,1,0},
 	pref_stats[NUM_PREFETCHERS],
-	num_misses = 0;
+	num_misses = 0,
+	total_score = 0;
 float accuracy[NUM_PREFETCHERS],
 	  useful_per_access[NUM_PREFETCHERS];
 
@@ -108,19 +109,27 @@ for(int i=0; i<NUM_PREFETCHERS; i++){
 		score[i] += (table[i].pref_req[j] && table[i].pref_useful[j]);
 		num_pf_issued[i] += table[i].pref_req[j];
 	}
-	if(prefetcher_use[i] == 1)
-		comb_score[i] = (score[i]/2) + (comb_score[i]/2);
-	accuracy[i] = ((float)score[i])/num_pf_issued[i];
-	useful_per_access[i] = ((float)score[i])/CHECK_SCORE;
-	final_score[i] = (int)((accuracy[i] + useful_per_access[i])*100);
+	if(prefetcher_use[i] == 1){
+		// comb_score[i] = (score[i]/2) + (comb_score[i]/2);
+		total_score = score[i] + total_score;		
+	}
+	
 	// if(to_pref[i] == 1)
 	// 	pref_stats[i] = pref_stats[i] + score[i];
 }
 
+for(int i=0; i<NUM_PREFETCHERS; i++)
+	if(prefetcher_use[i] == 1){
+		accuracy[i] = ((float)score[i])/num_pf_issued[i];
+		useful_per_access[i] = ((float)score[i])/total_score;
+		final_score[i] = (int)(((accuracy[i]*X) + (useful_per_access[i]*(1-X)))*100);
+	}
+
+
 	int max_score = 0, entry = 0;
 	for(int i=0; i<NUM_PREFETCHERS; i++)
-		if(comb_score[i] >= max_score){
-			max_score = comb_score[i];
+		if(final_score[i] >= max_score){
+			max_score = final_score[i];
 			entry = i;
 		}
 
@@ -138,6 +147,7 @@ for(int i=0; i<NUM_PREFETCHERS; i++){
 // for(int i=0; i<NUM_PREFETCHERS; i++)
 // 	printf("%lld ", final_score[i]);
 // printf("\n");
+
 // for(int i=0; i<NUM_PREFETCHERS; i++)
 // 	printf("%lld ", comb_score[i]);
 // printf("\n");
@@ -147,6 +157,7 @@ for(int i=0; i<NUM_PREFETCHERS; i++){
 	score[i] = 0;
 	to_pref[i] = 0;
 	num_pf_issued[i] = 0;
+	total_score = 0;
 	for(int j=0; j<NUM_RR_ENTRIES; j++){
 		table[i].tag[j] = 0;
 		table[i].pref_req[j] = 0;
