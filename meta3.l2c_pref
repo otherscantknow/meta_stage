@@ -105,11 +105,13 @@ for(int i=0; i<NUM_PREFETCHERS; i++){
 		score[i] += (table[i].pref_req[j] && table[i].pref_useful[j]);	// if pref is requested and useful, inc score
 		num_pf_issued[i] += table[i].pref_req[j];						// update total prefetch requests
 	}
+	if(prefetcher_use[i]==1)
+		total_score += score[i];
 }
 
 for(int i=0; i<NUM_PREFETCHERS; i++)
 	if(prefetcher_use[i] == 1){											// final reward calculating expression
-		final_score[i] = (int)(score[i] + sqrt(2*log(CHECK_SCORE)/num_pf_issued[i]));
+		final_score[i] = (int)((((float)score[i]/total_score) + sqrt(2*log(CHECK_SCORE)/num_pf_issued[i]))*100);
 	}
 
 
@@ -129,7 +131,10 @@ for(int i=0; i<NUM_PREFETCHERS; i++)
 // 	printf("%lld ", num_pf_issued[i]);
 // printf("\n");
 // for(int i=0; i<NUM_PREFETCHERS; i++)
-// 	printf("%f ", accuracy[i]);
+// 	printf("%f ", (float)score[i]/total_score);
+// printf("\n");
+// for(int i=0; i<NUM_PREFETCHERS; i++)
+// 	printf("%f ", sqrt(2*log(CHECK_SCORE)/num_pf_issued[i]));
 // printf("\n");
 // for(int i=0; i<NUM_PREFETCHERS; i++)
 // 	printf("%lld ", final_score[i]);
