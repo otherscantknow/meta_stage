@@ -18,7 +18,7 @@
 #define RR_INDEX 8
 #define NUM_RR_ENTRIES (1 << RR_INDEX)
 #define NUM_PREFETCHERS 7
-#define CHECK_SCORE 2048
+#define CHECK_SCORE 512
 
 /*
 Order:
