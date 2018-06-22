@@ -18,7 +18,40 @@
 #define RR_INDEX 8
 #define NUM_RR_ENTRIES (1 << RR_INDEX)
 #define NUM_PREFETCHERS 7
-#define CHECK_SCORE 512
+#define CHECK_SCORE 256
+#define NUM_BLOOM_ENTRIES 4096
+
+class BLOOM_FILTER {
+  public:
+    int b_filter[NUM_BLOOM_ENTRIES];
+      uint64_t pollution_avg, 
+          demand_avg, 
+          pollution_tot, 
+          demand_tot, 
+          evictions,
+
+          misses,
+          prefetches_avg,
+          used_avg,
+          prefetches_tot,
+          used_tot;
+  BLOOM_FILTER(){
+    for(int i=0; i<NUM_BLOOM_ENTRIES; i++){
+      b_filter[i] = 0;
+    }
+    pollution_avg = 0;
+    demand_avg = 0;
+    pollution_tot = 0;
+    demand_tot = 0;
+    evictions = 0;
+
+    misses = 0;
+    prefetches_avg = 0;
+    used_avg = 0;
+    prefetches_tot = 0;
+    used_tot = 0;
+  };
+};
 
 /*
 Order:
@@ -83,15 +116,15 @@ struct MinCompare
 
 };
 
-set< pair<int , int>, MinCompare > offset_scores;		// stores the offset and score for each round
-set<pair<int,int>> candidate_prefetchers;					// prefetchers whose score is higher than threshold and used for actual memory access
-int l2_access_counter = 0;				// maintains the number of L2 cache accesses for each evaluation period
-int current_evaluation_offset = -8;	// offset being evaluated in the present evaluation period
-int current_offset_score = 0;			// score of offset being presently evaluated
-set<uint64_t> sandbox;					// sandbox
-int last_max_offset = 8;				// maintains the maximum value of offset for the current round
-set<int> discarded_offsets;			// offsets discarded due to lower score than threshold
-set<int> evaluate_offsets;				// offsets to be evaluated in current round
+set< pair<int , int>, MinCompare > offset_scores;   // stores the offset and score for each round
+set<pair<int,int>> candidate_prefetchers;         // prefetchers whose score is higher than threshold and used for actual memory access
+int l2_access_counter = 0;        // maintains the number of L2 cache accesses for each evaluation period
+int current_evaluation_offset = -8; // offset being evaluated in the present evaluation period
+int current_offset_score = 0;     // score of offset being presently evaluated
+set<uint64_t> sandbox;          // sandbox
+int last_max_offset = 8;        // maintains the maximum value of offset for the current round
+set<int> discarded_offsets;     // offsets discarded due to lower score than threshold
+set<int> evaluate_offsets;        // offsets to be evaluated in current round
 
 
 void evaluate_prefetchers_initialize();
@@ -129,18 +162,18 @@ int recent_request[1<<RRINDEX];
 int prefetch_offset=1;
 
 struct offsets_scores {
-  int score[BO_NOFFSETS];		// maintains scores of each offset being considered		    
-  int max_score;          	// maintains maximum score for a particular learning phase
-  int best_offset;        	// best offset for a particular learning phase
-  int round;              	// latest round number 
-  int last;                   	// index of next offset to be considered in the learning phase
+  int score[BO_NOFFSETS];   // maintains scores of each offset being considered       
+  int max_score;            // maintains maximum score for a particular learning phase
+  int best_offset;          // best offset for a particular learning phase
+  int round;                // latest round number 
+  int last;                     // index of next offset to be considered in the learning phase
 } offset_score;                     
 
 
 struct delay_queue {
-  int lineaddr[DELAYQSIZE];	// array for implementation of the queue of addresses  
-  int valid[DELAYQSIZE];    	// for checking if slot at some index of key is available or not
-  int tail;                 	
+  int lineaddr[DELAYQSIZE]; // array for implementation of the queue of addresses  
+  int valid[DELAYQSIZE];      // for checking if slot at some index of key is available or not
+  int tail;                   
   int head;                 
 } delay_q;   
 
@@ -161,7 +194,7 @@ uint64_t issue_prefetch(uint64_t addr);
 int L2_DHB_update(uint32_t cpu,uint64_t addr);
 void L2_OPT_update(uint32_t cpu, uint64_t addr, int last_block);
 void L2_DPT_update(uint32_t cpu,uint64_t addr, int entry);
-int L2_DPT_check(uint32_t cpu, int *delta, int entry);
+delta_and_acc L2_DPT_check(uint32_t cpu, int *delta, int entry);
 uint64_t L2_OPT_check(uint32_t cpu, uint64_t addr);
 int L2_DPT_check(uint32_t cpu, int *delta, uint64_t curr_block);
 void L2_promote(uint32_t cpu, int entry, int table_num);
@@ -207,17 +240,17 @@ int PF_check(uint32_t cpu, int signature, int curr_block);
 
 //meta_pref
 class RECENT_REQUEST_TABLE {
-	public:
-		uint64_t tag[NUM_RR_ENTRIES],
-				 pref_req[NUM_RR_ENTRIES],
-				 pref_useful[NUM_RR_ENTRIES];
+  public:
+    uint64_t tag[NUM_RR_ENTRIES],
+         pref_req[NUM_RR_ENTRIES],
+         pref_useful[NUM_RR_ENTRIES];
 
-	RECENT_REQUEST_TABLE() {
-		for (int i=0; i<NUM_RR_ENTRIES; i++){
-			tag[i] = 0;
-			pref_req[i] = 0;
-			pref_useful[i] = 0;}
-	};
+  RECENT_REQUEST_TABLE() {
+    for (int i=0; i<NUM_RR_ENTRIES; i++){
+      tag[i] = 0;
+      pref_req[i] = 0;
+      pref_useful[i] = 0;}
+  };
 };
 
 extern RECENT_REQUEST_TABLE L2_RR[NUM_CPUS][NUM_PREFETCHERS];
